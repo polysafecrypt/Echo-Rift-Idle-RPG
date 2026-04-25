@@ -1,567 +1,847 @@
--- =============================================================================
--- ECHO RIFT — RIFT SHOP
--- =============================================================================
--- Quartermaster Nyx's marketplace.
--- Categories: war_pass, echo_pass, summon, dungeon_key, arena_token, gold, offer
--- Currencies: rc (rift crystal — premium), gold (in-game), real (IAP — placeholder)
--- =============================================================================
+// =============================================
+// ECHO RIFT — RIFT SHOP
+// Quartermaster Nyx's marketplace
+// =============================================
 
--- ── 1. SHOP ITEMS TABLE ─────────────────────────────────────────────────────
-create table if not exists public.shop_items (
-  id              uuid primary key default gen_random_uuid(),
-  code            text unique not null,           -- 'echo_pass', 'pass_gold_14', 'dungeon_key_1', etc.
-  category        text not null check (category in (
-                    'war_pass', 'echo_pass', 'summon', 'dungeon_key',
-                    'arena_token', 'gold', 'offer', 'rc_pack'
-                  )),
-  name            text not null,                  -- "Echo Pass — Battle Pass", "Gold War Pass · 14 days"
-  description     text not null,                  -- short helper text
-  lore            text,                           -- in-universe flavor: "From beyond the veil..."
-  icon            text not null,                  -- emoji fallback, will be replaced by image asset
-  asset_url       text,                           -- nullable, image override
-  rarity_tier     text not null default 'common'  -- common | rare | epic | legendary | dimensional
-                  check (rarity_tier in ('common','rare','epic','legendary','dimensional')),
+import React, { useState, useCallback, useEffect, useRef } from 'react'
+import {
+  View, Text, StyleSheet, ScrollView, TouchableOpacity,
+  StatusBar, Dimensions, RefreshControl, Modal, ActivityIndicator,
+  Animated, Easing,
+} from 'react-native'
+import { useFocusEffect } from '@react-navigation/native'
+import { supabase } from '../lib/supabase'
+import { useGameStore } from '../store/gameStore'
+import { useGame } from '../hooks/useGame'
+import { COLORS } from '../constants'
 
-  -- Pricing
-  currency        text not null check (currency in ('rc','gold','real')),
-  price           integer not null check (price >= 0),
-  discount_pct    integer not null default 0 check (discount_pct >= 0 and discount_pct <= 100),
-  bundle_value    text,                           -- "BEST VALUE" / "FIRST TIME" / "LIMITED"
+const { width } = Dimensions.get('window')
 
-  -- Reward (what player gets)
-  reward_type     text not null check (reward_type in (
-                    'rc','gold','summon_scroll','dungeon_key','arena_token',
-                    'pass_silver','pass_gold','echo_pass','bundle','first_purchase_bonus'
-                  )),
-  reward_amount   integer not null default 0,     -- units of reward (e.g. 5 keys, 5000 gold, 7 days pass)
-  reward_extra    jsonb,                          -- bundle contents: {"rc": 100, "scrolls": 5}
+// ─── TIER COLORS ─────────────────────────────────────────────────────────────
+const TIER_COLORS: Record<string, string> = {
+  common:      COLORS.textSecondary,
+  rare:        COLORS.rare,
+  epic:        COLORS.epic,
+  legendary:   COLORS.legendary,
+  dimensional: COLORS.dimensional,
+}
 
-  -- Limits
-  daily_limit     integer,                        -- max purchases per player per day (null = unlimited)
-  weekly_limit    integer,
-  account_limit   integer,                        -- one-time purchases (e.g. starter pack)
-  min_player_lvl  integer not null default 1,
+// ─── CATEGORY → TAB GROUPING ─────────────────────────────────────────────────
+type TabKey = 'all' | 'offers' | 'passes' | 'summon' | 'supplies' | 'crystals'
 
-  -- Visibility
-  is_active       boolean not null default true,
-  is_featured     boolean not null default false, -- "TODAY'S DEAL" hero banner
-  available_from  timestamptz,                    -- null = always; for time-limited offers
-  available_until timestamptz,
-  sort_order      integer not null default 100,
+const TABS: { key: TabKey; label: string; icon: string }[] = [
+  { key: 'all',      label: 'ALL',      icon: '✦' },
+  { key: 'offers',   label: 'OFFERS',   icon: '🔥' },
+  { key: 'passes',   label: 'PASSES',   icon: '👑' },
+  { key: 'summon',   label: 'SUMMON',   icon: '🪬' },
+  { key: 'supplies', label: 'SUPPLIES', icon: '⚙️' },
+  { key: 'crystals', label: 'CRYSTALS', icon: '💎' },
+]
 
-  created_at      timestamptz not null default now(),
-  updated_at      timestamptz not null default now()
-);
+const TAB_FILTER: Record<TabKey, string[] | null> = {
+  all:      null,
+  offers:   ['offer'],
+  passes:   ['war_pass', 'echo_pass'],
+  summon:   ['summon'],
+  supplies: ['dungeon_key', 'arena_token', 'gold'],
+  crystals: ['rc_pack'],
+}
 
-create index if not exists idx_shop_items_category   on public.shop_items(category) where is_active = true;
-create index if not exists idx_shop_items_featured   on public.shop_items(is_featured) where is_featured = true;
-create index if not exists idx_shop_items_window     on public.shop_items(available_from, available_until) where is_active = true;
+// ─── TYPES ───────────────────────────────────────────────────────────────────
+interface ShopItem {
+  code: string
+  category: string
+  name: string
+  description: string
+  lore: string | null
+  icon: string
+  asset_url: string | null
+  rarity_tier: string
+  currency: 'rc' | 'gold' | 'real'
+  price: number
+  discounted_price: number
+  discount_pct: number
+  bundle_value: string | null
+  reward_type: string
+  reward_amount: number
+  reward_extra: any
+  daily_limit: number | null
+  account_limit: number | null
+  min_player_lvl: number
+  is_featured: boolean
+  sort_order: number
+  purchased_today: number
+  is_locked: boolean
+  lock_reason: string | null
+  is_sold_out: boolean
+  available_until: string | null
+}
 
--- Idempotent constraint update (eski tablo zaten varsa max=90 olabilir, yenisi max=100)
-alter table public.shop_items drop constraint if exists shop_items_discount_pct_check;
-alter table public.shop_items add  constraint shop_items_discount_pct_check
-  check (discount_pct >= 0 and discount_pct <= 100);
+interface ShopData {
+  player: {
+    level: number
+    rc: number
+    gold: number
+    summon_scrolls: number
+    pass_type: string
+    pass_expires_at: string | null
+    echo_pass_expires_at: string | null
+    first_purchase_made: boolean
+    dungeon_extra_today: number
+    arena_extra_today: number
+  }
+  items: ShopItem[]
+}
 
--- ── 2. PURCHASE LOG ─────────────────────────────────────────────────────────
-create table if not exists public.shop_purchase_log (
-  id                uuid primary key default gen_random_uuid(),
-  player_id         uuid not null references public.players(id) on delete cascade,
-  item_code         text not null,
-  category          text not null,
-  currency          text not null,
-  price_paid        integer not null,
-  reward_type       text not null,
-  reward_amount     integer not null,
-  reward_extra      jsonb,
-  idempotency_key   text,
-  purchased_at      timestamptz not null default now()
-);
+// ═════════════════════════════════════════════════════════════════════════════
+// MAIN SCREEN
+// ═════════════════════════════════════════════════════════════════════════════
+export default function ShopScreen({ navigation }: any) {
+  const { fetchPlayerState } = useGame()
+  const [userId, setUserId] = useState<string | null>(null)
+  const [data, setData] = useState<ShopData | null>(null)
+  const [activeTab, setActiveTab] = useState<TabKey>('all')
+  const [refreshing, setRefreshing] = useState(false)
+  const [selectedItem, setSelectedItem] = useState<ShopItem | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
-create index if not exists idx_shop_log_player on public.shop_purchase_log(player_id, purchased_at desc);
-create index if not exists idx_shop_log_player_item on public.shop_purchase_log(player_id, item_code, purchased_at desc);
-create unique index if not exists idx_shop_log_idempotency on public.shop_purchase_log(player_id, idempotency_key)
-  where idempotency_key is not null;
+  const loadShop = useCallback(async (uid?: string | null) => {
+    const id = uid ?? userId
+    if (!id) {
+      setLoadError('No authenticated user.')
+      return
+    }
+    setLoadError(null)
+    const { data: res, error } = await supabase.rpc('get_shop_offers', { p_player_id: id })
+    if (error) {
+      console.error('[Shop] RPC error:', error)
+      setLoadError(`RPC error: ${error.message ?? 'unknown'}`)
+      return
+    }
+    if (!res) {
+      setLoadError('No response from server.')
+      return
+    }
+    if (!res.success) {
+      console.error('[Shop] RPC returned failure:', res)
+      setLoadError(`Shop error: ${res.error ?? 'UNKNOWN'}${res.message ? ' — ' + res.message : ''}`)
+      return
+    }
+    setData(res as ShopData)
+  }, [userId])
 
-alter table public.shop_purchase_log enable row level security;
+  useFocusEffect(useCallback(() => {
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (user) {
+        setUserId(user.id)
+        loadShop(user.id)
+      } else {
+        setLoadError('Not signed in.')
+      }
+    })
+  }, []))
 
-drop policy if exists "shop_log_select_own" on public.shop_purchase_log;
-create policy "shop_log_select_own" on public.shop_purchase_log
-  for select using (auth.uid() = player_id);
+  const onRefresh = async () => {
+    setRefreshing(true)
+    await loadShop()
+    setRefreshing(false)
+  }
 
-drop policy if exists "shop_log_no_direct_write" on public.shop_purchase_log;
-create policy "shop_log_no_direct_write" on public.shop_purchase_log
-  for insert with check (false);
+  const handlePurchaseSuccess = async () => {
+    // Reload shop offers + global player state
+    await loadShop()
+    if (userId) await fetchPlayerState(userId)
+  }
 
--- ── 3. PLAYER COLUMNS (idempotent, won't overwrite existing) ───────────────
-do $$
-begin
-  if not exists (select 1 from information_schema.columns where table_name='players' and column_name='dungeon_extra_today') then
-    alter table public.players add column dungeon_extra_today integer not null default 0;
-  end if;
-  if not exists (select 1 from information_schema.columns where table_name='players' and column_name='arena_extra_today') then
-    alter table public.players add column arena_extra_today integer not null default 0;
-  end if;
-  if not exists (select 1 from information_schema.columns where table_name='players' and column_name='echo_pass_expires_at') then
-    alter table public.players add column echo_pass_expires_at timestamptz;
-  end if;
-  if not exists (select 1 from information_schema.columns where table_name='players' and column_name='pass_expires_at') then
-    alter table public.players add column pass_expires_at timestamptz;
-  end if;
-  if not exists (select 1 from information_schema.columns where table_name='players' and column_name='first_purchase_made') then
-    alter table public.players add column first_purchase_made boolean not null default false;
-  end if;
-end $$;
-
--- ── 4. SEED DATA — RIFT SHOP CATALOG ────────────────────────────────────────
--- Idempotent: re-running this won't duplicate
-insert into public.shop_items (code, category, name, description, lore, icon, rarity_tier,
-                                currency, price, discount_pct, bundle_value,
-                                reward_type, reward_amount, reward_extra,
-                                daily_limit, weekly_limit, account_limit, min_player_lvl,
-                                is_active, is_featured, sort_order)
-values
-
--- ═══ RC PACKS (real money — placeholders, IAP later) ═══
-('rc_pack_80',     'rc_pack', 'Stardust Vial',          'A small handful of compressed rift energy.',
- 'Common drop in the outer sectors. Useful for a quick spark.',
- '💠', 'common',    'real', 99,    0, null,
- 'rc', 80, null, null, null, null, 1, true, false, 1),
-
-('rc_pack_450',    'rc_pack', 'Crystal Cluster',        '450 RC. The standard miner''s yield.',
- 'Carved from frozen rift veins. Powers a fleet for a week.',
- '💎', 'rare',      'real', 499,   0, null,
- 'rc', 450, null, null, null, null, 1, true, false, 2),
-
-('rc_pack_950',    'rc_pack', 'Voidcore Shard',         '950 RC. Best ratio for active commanders.',
- 'Pried from the heart of a dying anomaly.',
- '💎', 'epic',      'real', 999,   5, 'POPULAR',
- 'rc', 950, null, null, null, null, 1, true, false, 3),
-
-('rc_pack_2000',   'rc_pack', 'Singularity Core',       '2000 RC. For those who plan ahead.',
- 'They say one shard could power an entire colony.',
- '🔮', 'epic',      'real', 1999,  10, 'BEST VALUE',
- 'rc', 2000, null, null, null, null, 1, true, true, 4),
-
-('rc_pack_5500',   'rc_pack', 'Rift Heart',             '5500 RC. Commander''s arsenal.',
- 'A relic of the first Rift War. Reserved for veterans.',
- '🌌', 'legendary', 'real', 4999,  15, null,
- 'rc', 5500, null, null, null, null, 1, true, false, 5),
-
-('rc_pack_12000',  'rc_pack', 'Dimensional Vault',      '12000 RC. The Quartermaster''s top shelf.',
- 'Whispered about, rarely seen. The ultimate stockpile.',
- '⚡', 'dimensional','real', 9999, 20, 'LEGENDARY',
- 'rc', 12000, null, null, null, null, 1, true, false, 6),
-
--- ═══ WAR PASS ═══
-('pass_silver_7',  'war_pass', 'Silver War Pass',       '7 days · +50% XP, +25% Gold, +1 quest slot',
- 'Standard issue for active operatives.',
- '🥈', 'rare',      'rc', 290, 0, null,
- 'pass_silver', 7, null, null, null, null, 1, true, false, 10),
-
-('pass_gold_14',   'war_pass', 'Gold War Pass · 14d',   '14 days · +100% XP, +50% Gold, +2 quest slots, daily login bonus',
- 'Reserved for commanders. Doubles your accumulated essence.',
- '🥇', 'epic',      'rc', 990, 0, 'POPULAR',
- 'pass_gold', 14, null, null, null, null, 5, true, true, 11),
-
-('pass_gold_21',   'war_pass', 'Gold War Pass · 21d',   '21 days · all Gold benefits + bonus chest',
- 'A campaign-length stockpile. Rumored to grant favors from Nyx herself.',
- '👑', 'legendary', 'rc', 1390, 10, 'BEST VALUE',
- 'pass_gold', 21, jsonb_build_object('bonus_scrolls', 10, 'bonus_rc', 200), null, null, null, 10, true, false, 12),
-
--- ═══ ECHO PASS ═══
-('echo_pass_30',   'echo_pass', 'Echo Pass · Season',   '30 days · unlock all Echo milestones · +RC at every tier',
- 'A scribed contract bound to the rift current. Records every echo of your battles.',
- '📜', 'legendary', 'rc', 990, 0, 'SEASON DEAL',
- 'echo_pass', 30, null, null, null, 1, 5, true, false, 20),
-
--- ═══ SUMMON SCROLLS ═══
-('summon_scroll_1',  'summon', 'Echo Sigil',            'Single summon scroll · pulls champion from beyond.',
- 'A rune-etched glyph. One use. Calls a soul from the void.',
- '🪬', 'common',    'rc', 80, 0, null,
- 'summon_scroll', 1, null, null, null, null, 1, true, false, 30),
-
-('summon_scroll_10', 'summon', 'Echo Sigil · Bundle x10','10 scrolls bundle · 20% off bulk',
- 'A sealed sigil cluster. Quartermaster keeps these in the back room.',
- '📜', 'rare',      'rc', 640, 20, 'BULK',
- 'summon_scroll', 10, null, null, null, null, 1, true, false, 31),
-
-('summon_scroll_30', 'summon', 'Echo Sigil · Cache x30', '30 scrolls · 30% off · pity carry guarantee',
- 'A locked cache. Enough sigils for a guaranteed legendary pull.',
- '🗃️', 'epic',      'rc', 1680, 30, 'BEST VALUE',
- 'summon_scroll', 30, null, null, null, null, 1, true, false, 32),
-
--- ═══ DUNGEON KEYS ═══
-('dungeon_key_1',  'dungeon_key', 'Rift Key',           'Extra dungeon entry · max 5 per day',
- 'Forged in starlight. Cracks open one fold in the rift.',
- '🗝️', 'common',    'rc', 40, 0, null,
- 'dungeon_key', 1, null, 5, null, null, 5, true, false, 40),
-
-('dungeon_key_3',  'dungeon_key', 'Rift Key · Triple',  '3 dungeon keys bundle · 15% off',
- 'A small ring of tempered keys. For the persistent.',
- '🔑', 'rare',      'rc', 100, 15, null,
- 'dungeon_key', 3, null, 1, null, null, 8, true, false, 41),
-
--- ═══ ARENA TOKENS ═══
-('arena_token_1',  'arena_token', 'Arena Sigil',        'Extra arena battle · max 5 per day',
- 'A duelist''s mark. Grants entry to the gladiator pits.',
- '⚔️', 'common',    'rc', 40, 0, null,
- 'arena_token', 1, null, 5, null, null, 5, true, false, 50),
-
-('arena_token_3',  'arena_token', 'Arena Sigil · Triple','3 arena tokens · 15% off',
- 'A trio of sigils, freshly minted. The crowd waits.',
- '⚔️', 'rare',      'rc', 100, 15, null,
- 'arena_token', 3, null, 1, null, null, 8, true, false, 51),
-
--- ═══ GOLD SACKS ═══
-('gold_sack_small', 'gold', 'Gold Sack · Small',        '5,000 Gold · for everyday quartermastering',
- 'Coins from a hundred fallen colonies. They clink with stories.',
- '💰', 'common',    'rc', 50, 0, null,
- 'gold', 5000, null, 3, null, null, 1, true, false, 60),
-
-('gold_sack_med',   'gold', 'Gold Sack · Medium',       '15,000 Gold · 10% off vs small',
- 'A heavier bag. Nyx weighs it twice before handing it over.',
- '💰', 'rare',      'rc', 130, 10, null,
- 'gold', 15000, null, 3, null, null, 5, true, false, 61),
-
-('gold_sack_large', 'gold', 'Gold Vault',               '50,000 Gold · 20% off bulk',
- 'Sealed vault, three locks. Worth a small fleet.',
- '💎', 'epic',      'rc', 400, 20, 'BEST VALUE',
- 'gold', 50000, null, 1, null, null, 10, true, false, 62),
-
--- ═══ FIRST PURCHASE BONUS ═══
-('first_buy_bonus', 'offer', 'First Purchase Bonus',    'DOUBLE RC on your first ever real-money purchase!',
- 'Quartermaster smiles. New blood gets a welcoming gift.',
- '🎁', 'legendary', 'rc', 0, 100, 'FIRST TIME',
- 'first_purchase_bonus', 1, null, null, null, 1, 1, true, false, 70),
-
--- ═══ ROTATING DAILY OFFER (placeholder example) ═══
-('daily_offer_chest','offer', 'Quartermaster''s Daily', 'Mystery cache · refreshes every 24h',
- 'Nyx empties her pockets at sunrise. What''s inside today?',
- '📦', 'epic',      'rc', 240, 25, 'TODAY ONLY',
- 'bundle', 1, jsonb_build_object('gold', 5000, 'scrolls', 3, 'rc', 50),
- 1, null, null, 5, true, true, 80)
-
-on conflict (code) do update set
-  name           = excluded.name,
-  description    = excluded.description,
-  lore           = excluded.lore,
-  icon           = excluded.icon,
-  rarity_tier    = excluded.rarity_tier,
-  price          = excluded.price,
-  discount_pct   = excluded.discount_pct,
-  bundle_value   = excluded.bundle_value,
-  reward_type    = excluded.reward_type,
-  reward_amount  = excluded.reward_amount,
-  reward_extra   = excluded.reward_extra,
-  daily_limit    = excluded.daily_limit,
-  weekly_limit   = excluded.weekly_limit,
-  account_limit  = excluded.account_limit,
-  min_player_lvl = excluded.min_player_lvl,
-  is_active      = excluded.is_active,
-  is_featured    = excluded.is_featured,
-  sort_order     = excluded.sort_order,
-  updated_at     = now();
-
--- ═════════════════════════════════════════════════════════════════════════════
--- 5. RPC: GET_SHOP_OFFERS
--- ═════════════════════════════════════════════════════════════════════════════
-create or replace function public.get_shop_offers(p_player_id uuid)
-returns jsonb
-language plpgsql
-stable
-as $$
-declare
-  v_player record;
-  v_items  jsonb;
-  v_today_purchases jsonb;
-begin
-  if auth.uid() is null or auth.uid() != p_player_id then
-    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
-  end if;
-
-  select id, level, rc_balance, gold, summon_scrolls, pass_type, pass_expires_at, echo_pass_expires_at,
-         first_purchase_made, dungeon_extra_today, arena_extra_today
-  into v_player
-  from public.players where id = p_player_id;
-
-  if not found then
-    return jsonb_build_object('success', false, 'error', 'PLAYER_NOT_FOUND');
-  end if;
-
-  -- Today's purchases per item_code (for daily_limit enforcement)
-  select coalesce(jsonb_object_agg(item_code, cnt), '{}'::jsonb)
-  into v_today_purchases
-  from (
-    select item_code, count(*) as cnt
-    from public.shop_purchase_log
-    where player_id = p_player_id
-      and purchased_at >= date_trunc('day', now())
-    group by item_code
-  ) t;
-
-  -- All active items, with player-specific lock/limit info
-  select coalesce(jsonb_agg(jsonb_build_object(
-    'code',           si.code,
-    'category',       si.category,
-    'name',           si.name,
-    'description',    si.description,
-    'lore',           si.lore,
-    'icon',           si.icon,
-    'asset_url',      si.asset_url,
-    'rarity_tier',    si.rarity_tier,
-    'currency',       si.currency,
-    'price',          si.price,
-    'discounted_price', floor(si.price * (1 - si.discount_pct::numeric / 100)),
-    'discount_pct',   si.discount_pct,
-    'bundle_value',   si.bundle_value,
-    'reward_type',    si.reward_type,
-    'reward_amount',  si.reward_amount,
-    'reward_extra',   si.reward_extra,
-    'daily_limit',    si.daily_limit,
-    'account_limit',  si.account_limit,
-    'min_player_lvl', si.min_player_lvl,
-    'is_featured',    si.is_featured,
-    'sort_order',     si.sort_order,
-    'purchased_today', coalesce((v_today_purchases->>si.code)::int, 0),
-    'is_locked',      v_player.level < si.min_player_lvl,
-    'lock_reason',    case when v_player.level < si.min_player_lvl
-                        then 'Requires Lv ' || si.min_player_lvl::text
-                        else null end,
-    'is_sold_out',
-      (si.daily_limit is not null and coalesce((v_today_purchases->>si.code)::int, 0) >= si.daily_limit)
-      or (si.account_limit is not null and exists (
-        select 1 from public.shop_purchase_log spl
-        where spl.player_id = p_player_id and spl.item_code = si.code
-        having count(*) >= si.account_limit
-      )),
-    'available_until', si.available_until
-  ) order by si.sort_order, si.created_at), '[]'::jsonb)
-  into v_items
-  from public.shop_items si
-  where si.is_active = true
-    and (si.available_from is null or si.available_from <= now())
-    and (si.available_until is null or si.available_until > now());
-
-  return jsonb_build_object(
-    'success', true,
-    'player', jsonb_build_object(
-      'level',              v_player.level,
-      'rc',                 v_player.rc_balance,
-      'gold',               v_player.gold,
-      'summon_scrolls',     v_player.summon_scrolls,
-      'pass_type',          v_player.pass_type,
-      'pass_expires_at',    v_player.pass_expires_at,
-      'echo_pass_expires_at', v_player.echo_pass_expires_at,
-      'first_purchase_made',  v_player.first_purchase_made,
-      'dungeon_extra_today',  v_player.dungeon_extra_today,
-      'arena_extra_today',    v_player.arena_extra_today
-    ),
-    'items', v_items,
-    'server_time', now()
-  );
-end;
-$$;
-
-grant execute on function public.get_shop_offers(uuid) to authenticated;
-
--- ═════════════════════════════════════════════════════════════════════════════
--- 6. RPC: PURCHASE_SHOP_ITEM
--- ═════════════════════════════════════════════════════════════════════════════
-create or replace function public.purchase_shop_item(
-  p_player_id       uuid,
-  p_item_code       text,
-  p_idempotency_key text default null
-)
-returns jsonb
-language plpgsql
-security definer
-as $$
-declare
-  v_player    record;
-  v_item      record;
-  v_final_price integer;
-  v_today_count integer;
-  v_account_count integer;
-  v_reward_summary jsonb;
-  v_now timestamptz := now();
-begin
-  if auth.uid() is null or auth.uid() != p_player_id then
-    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
-  end if;
-
-  -- Idempotency check
-  if p_idempotency_key is not null then
-    if exists (select 1 from public.shop_purchase_log
-               where player_id = p_player_id and idempotency_key = p_idempotency_key) then
-      return jsonb_build_object('success', false, 'error', 'DUPLICATE_REQUEST');
-    end if;
-  end if;
-
-  -- Lock player row
-  select id, level, rc_balance, gold, summon_scrolls, pass_type, pass_expires_at,
-         echo_pass_expires_at, first_purchase_made,
-         coalesce(dungeon_extra_today, 0) as dungeon_extra_today,
-         coalesce(arena_extra_today, 0)   as arena_extra_today
-  into v_player
-  from public.players where id = p_player_id for update;
-
-  if not found then
-    return jsonb_build_object('success', false, 'error', 'PLAYER_NOT_FOUND');
-  end if;
-
-  -- Get item
-  select * into v_item
-  from public.shop_items
-  where code = p_item_code and is_active = true
-    and (available_from is null or available_from <= v_now)
-    and (available_until is null or available_until > v_now);
-
-  if not found then
-    return jsonb_build_object('success', false, 'error', 'ITEM_NOT_FOUND');
-  end if;
-
-  -- Level requirement
-  if v_player.level < v_item.min_player_lvl then
-    return jsonb_build_object('success', false, 'error', 'LEVEL_TOO_LOW',
-      'required_level', v_item.min_player_lvl);
-  end if;
-
-  -- Daily limit
-  if v_item.daily_limit is not null then
-    select count(*) into v_today_count
-    from public.shop_purchase_log
-    where player_id = p_player_id and item_code = p_item_code
-      and purchased_at >= date_trunc('day', v_now);
-    if v_today_count >= v_item.daily_limit then
-      return jsonb_build_object('success', false, 'error', 'DAILY_LIMIT_REACHED',
-        'limit', v_item.daily_limit);
-    end if;
-  end if;
-
-  -- Account limit (one-time / lifetime)
-  if v_item.account_limit is not null then
-    select count(*) into v_account_count
-    from public.shop_purchase_log
-    where player_id = p_player_id and item_code = p_item_code;
-    if v_account_count >= v_item.account_limit then
-      return jsonb_build_object('success', false, 'error', 'ALREADY_PURCHASED');
-    end if;
-  end if;
-
-  -- Compute final price (after discount)
-  v_final_price := floor(v_item.price * (1 - v_item.discount_pct::numeric / 100));
-
-  -- Currency check & deduction
-  if v_item.currency = 'rc' then
-    if v_player.rc_balance < v_final_price then
-      return jsonb_build_object('success', false, 'error', 'INSUFFICIENT_RC',
-        'required', v_final_price, 'available', v_player.rc_balance);
-    end if;
-    update public.players set rc_balance = rc_balance - v_final_price, updated_at = v_now
-    where id = p_player_id;
-  elsif v_item.currency = 'gold' then
-    if v_player.gold < v_final_price then
-      return jsonb_build_object('success', false, 'error', 'INSUFFICIENT_GOLD',
-        'required', v_final_price, 'available', v_player.gold);
-    end if;
-    update public.players set gold = gold - v_final_price, updated_at = v_now
-    where id = p_player_id;
-  elsif v_item.currency = 'real' then
-    -- IAP placeholder — real payments via RevenueCat/Stripe webhook (separate flow)
-    return jsonb_build_object('success', false, 'error', 'IAP_NOT_AVAILABLE',
-      'message', 'Real-money purchases coming soon.');
-  end if;
-
-  -- Apply reward
-  v_reward_summary := jsonb_build_object('type', v_item.reward_type, 'amount', v_item.reward_amount);
-
-  if v_item.reward_type = 'rc' then
-    update public.players set rc_balance = rc_balance + v_item.reward_amount where id = p_player_id;
-  elsif v_item.reward_type = 'gold' then
-    update public.players set gold = gold + v_item.reward_amount where id = p_player_id;
-  elsif v_item.reward_type = 'summon_scroll' then
-    update public.players set summon_scrolls = summon_scrolls + v_item.reward_amount where id = p_player_id;
-  elsif v_item.reward_type = 'dungeon_key' then
-    update public.players set
-      dungeon_extra_today = coalesce(dungeon_extra_today, 0) + v_item.reward_amount
-    where id = p_player_id;
-  elsif v_item.reward_type = 'arena_token' then
-    update public.players set
-      arena_extra_today = coalesce(arena_extra_today, 0) + v_item.reward_amount
-    where id = p_player_id;
-  elsif v_item.reward_type = 'pass_silver' then
-    update public.players set
-      pass_type = 'silver',
-      pass_expires_at = greatest(coalesce(pass_expires_at, v_now), v_now) + (v_item.reward_amount || ' days')::interval
-    where id = p_player_id;
-  elsif v_item.reward_type = 'pass_gold' then
-    update public.players set
-      pass_type = 'gold',
-      pass_expires_at = greatest(coalesce(pass_expires_at, v_now), v_now) + (v_item.reward_amount || ' days')::interval
-    where id = p_player_id;
-    -- Apply bundle extras (bonus scrolls, rc)
-    if v_item.reward_extra is not null then
-      if (v_item.reward_extra->>'bonus_rc') is not null then
-        update public.players set rc_balance = rc_balance + (v_item.reward_extra->>'bonus_rc')::int where id = p_player_id;
-      end if;
-      if (v_item.reward_extra->>'bonus_scrolls') is not null then
-        update public.players set summon_scrolls = summon_scrolls + (v_item.reward_extra->>'bonus_scrolls')::int where id = p_player_id;
-      end if;
-    end if;
-  elsif v_item.reward_type = 'echo_pass' then
-    update public.players set
-      echo_pass_expires_at = greatest(coalesce(echo_pass_expires_at, v_now), v_now) + (v_item.reward_amount || ' days')::interval
-    where id = p_player_id;
-  elsif v_item.reward_type = 'bundle' then
-    -- Bundle: parse reward_extra and apply each
-    if v_item.reward_extra is not null then
-      if (v_item.reward_extra->>'rc') is not null then
-        update public.players set rc_balance = rc_balance + (v_item.reward_extra->>'rc')::int where id = p_player_id;
-      end if;
-      if (v_item.reward_extra->>'gold') is not null then
-        update public.players set gold = gold + (v_item.reward_extra->>'gold')::int where id = p_player_id;
-      end if;
-      if (v_item.reward_extra->>'scrolls') is not null then
-        update public.players set summon_scrolls = summon_scrolls + (v_item.reward_extra->>'scrolls')::int where id = p_player_id;
-      end if;
-    end if;
-  end if;
-
-  -- Log purchase
-  insert into public.shop_purchase_log (
-    player_id, item_code, category, currency, price_paid,
-    reward_type, reward_amount, reward_extra, idempotency_key
-  ) values (
-    p_player_id, v_item.code, v_item.category, v_item.currency, v_final_price,
-    v_item.reward_type, v_item.reward_amount, v_item.reward_extra, p_idempotency_key
-  );
-
-  -- Refresh updated player snapshot
-  select rc_balance, gold, summon_scrolls, pass_type, pass_expires_at, echo_pass_expires_at,
-         dungeon_extra_today, arena_extra_today
-  into v_player
-  from public.players where id = p_player_id;
-
-  return jsonb_build_object(
-    'success',         true,
-    'item_code',       p_item_code,
-    'item_name',       v_item.name,
-    'price_paid',      v_final_price,
-    'currency',        v_item.currency,
-    'reward',          v_reward_summary,
-    'reward_extra',    v_item.reward_extra,
-    'player', jsonb_build_object(
-      'rc',                  v_player.rc_balance,
-      'gold',                v_player.gold,
-      'summon_scrolls',      v_player.summon_scrolls,
-      'pass_type',           v_player.pass_type,
-      'pass_expires_at',     v_player.pass_expires_at,
-      'echo_pass_expires_at', v_player.echo_pass_expires_at,
-      'dungeon_extra_today', v_player.dungeon_extra_today,
-      'arena_extra_today',   v_player.arena_extra_today
+  if (loadError) {
+    return (
+      <View style={styles.loadingContainer}>
+        <Text style={styles.errorIcon}>⚠</Text>
+        <Text style={styles.errorTitle}>SHOP UNAVAILABLE</Text>
+        <Text style={styles.errorMsg}>{loadError}</Text>
+        <TouchableOpacity style={styles.retryBtn} onPress={() => { setData(null); loadShop() }}>
+          <Text style={styles.retryText}>RETRY</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.retryBtn} onPress={() => navigation.goBack()}>
+          <Text style={styles.retryText}>← BACK</Text>
+        </TouchableOpacity>
+      </View>
     )
-  );
-end;
-$$;
+  }
 
-grant execute on function public.purchase_shop_item(uuid, text, text) to authenticated;
+  if (!data) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color={COLORS.cyan} />
+        <Text style={styles.loadingText}>QUARTERMASTER STANDING BY...</Text>
+      </View>
+    )
+  }
+
+  const { player } = data
+
+  // Filter items by active tab
+  const filter = TAB_FILTER[activeTab]
+  const visibleItems = filter
+    ? data.items.filter(it => filter.includes(it.category))
+    : data.items
+
+  // Featured hero (first is_featured item, all categories)
+  const featured = data.items.find(it => it.is_featured && it.category === 'offer')
+                 || data.items.find(it => it.is_featured)
+
+  return (
+    <View style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
+
+      {/* ─── HEADER ─── */}
+      <View style={styles.header}>
+        <TouchableOpacity onPress={() => navigation.goBack()}>
+          <Text style={styles.backBtn}>← BACK</Text>
+        </TouchableOpacity>
+        <View style={styles.headerCenter}>
+          <Text style={styles.headerTitle}>RIFT SHOP</Text>
+          <Text style={styles.headerSub}>Quartermaster Nyx</Text>
+        </View>
+        <View style={styles.balanceCol}>
+          <View style={styles.balanceRow}>
+            <Text style={styles.balanceIcon}>💎</Text>
+            <Text style={[styles.balanceText, { color: COLORS.cyan }]}>{player.rc.toLocaleString()}</Text>
+          </View>
+          <View style={styles.balanceRow}>
+            <Text style={styles.balanceIcon}>🪙</Text>
+            <Text style={[styles.balanceText, { color: COLORS.gold }]}>{player.gold.toLocaleString()}</Text>
+          </View>
+        </View>
+      </View>
+
+      <ScrollView
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={COLORS.neonGreen} />}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.scrollContent}
+      >
+        {/* ─── FEATURED HERO ─── */}
+        {featured && activeTab === 'all' && (
+          <FeaturedHero item={featured} onPress={() => setSelectedItem(featured)} />
+        )}
+
+        {/* ─── TABS ─── */}
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.tabRow}
+        >
+          {TABS.map(t => (
+            <TouchableOpacity
+              key={t.key}
+              style={[styles.tab, activeTab === t.key && styles.tabActive]}
+              onPress={() => setActiveTab(t.key)}
+              activeOpacity={0.7}
+            >
+              <Text style={[styles.tabText, activeTab === t.key && styles.tabTextActive]}>
+                {t.icon} {t.label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+
+        {/* ─── ITEMS ─── */}
+        <View style={styles.itemsList}>
+          {visibleItems
+            .filter(it => !(featured && activeTab === 'all' && it.code === featured.code))
+            .map(item => (
+              <ShopItemCard
+                key={item.code}
+                item={item}
+                onPress={() => !item.is_locked && !item.is_sold_out && setSelectedItem(item)}
+              />
+            ))}
+          {visibleItems.length === 0 && (
+            <Text style={styles.emptyText}>Nothing on the shelves here, commander.</Text>
+          )}
+        </View>
+
+        <View style={{ height: 80 }} />
+      </ScrollView>
+
+      {/* ─── BUY MODAL ─── */}
+      <BuyModal
+        item={selectedItem}
+        playerRc={player.rc}
+        playerGold={player.gold}
+        onClose={() => setSelectedItem(null)}
+        onSuccess={handlePurchaseSuccess}
+      />
+    </View>
+  )
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FEATURED HERO BANNER
+// ═════════════════════════════════════════════════════════════════════════════
+function FeaturedHero({ item, onPress }: { item: ShopItem; onPress: () => void }) {
+  const tierColor = TIER_COLORS[item.rarity_tier] ?? COLORS.cyan
+  const pulse = useRef(new Animated.Value(0)).current
+
+  useEffect(() => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 1, duration: 1400, useNativeDriver: false }),
+        Animated.timing(pulse, { toValue: 0, duration: 1400, useNativeDriver: false }),
+      ])
+    ).start()
+  }, [])
+
+  const glowOp = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.18, 0.45] })
+
+  return (
+    <TouchableOpacity
+      activeOpacity={0.85}
+      onPress={onPress}
+      style={[styles.heroCard, { borderColor: tierColor + '80' }]}
+    >
+      <Animated.View style={[styles.heroGlow, { backgroundColor: tierColor, opacity: glowOp }]} />
+      <View style={styles.heroBadge}>
+        <Text style={styles.heroBadgeText}>★ TODAY'S DEAL</Text>
+      </View>
+      <View style={styles.heroContent}>
+        <Text style={styles.heroIcon}>{item.icon}</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={[styles.heroName, { color: tierColor }]}>{item.name}</Text>
+          <Text style={styles.heroDesc} numberOfLines={2}>{item.description}</Text>
+          <View style={styles.heroPriceRow}>
+            {item.discount_pct > 0 && (
+              <Text style={styles.heroOriginalPrice}>
+                {item.price} {item.currency.toUpperCase()}
+              </Text>
+            )}
+            <Text style={[styles.heroPrice, { color: tierColor }]}>
+              {item.discounted_price} {item.currency.toUpperCase()}
+            </Text>
+            {item.discount_pct > 0 && (
+              <View style={[styles.heroDiscount, { backgroundColor: COLORS.error }]}>
+                <Text style={styles.heroDiscountText}>-{item.discount_pct}%</Text>
+              </View>
+            )}
+          </View>
+        </View>
+      </View>
+    </TouchableOpacity>
+  )
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SHOP ITEM CARD
+// ═════════════════════════════════════════════════════════════════════════════
+function ShopItemCard({ item, onPress }: { item: ShopItem; onPress: () => void }) {
+  const tierColor = TIER_COLORS[item.rarity_tier] ?? COLORS.textSecondary
+  const isRcPack = item.category === 'rc_pack'  // IAP placeholder
+  const dimmed = item.is_locked || item.is_sold_out || isRcPack
+
+  const currencyIcon = item.currency === 'rc' ? '💎'
+                    : item.currency === 'gold' ? '🪙'
+                    : '$'
+  const currencyLabel = item.currency === 'real' ? 'USD' : item.currency.toUpperCase()
+
+  return (
+    <TouchableOpacity
+      activeOpacity={dimmed ? 1 : 0.75}
+      disabled={dimmed}
+      onPress={onPress}
+      style={[
+        styles.itemCard,
+        { borderColor: tierColor + '50' },
+        dimmed && styles.itemCardDimmed,
+      ]}
+    >
+      {/* Bundle badge */}
+      {item.bundle_value && (
+        <View style={[styles.itemBadge, { backgroundColor: tierColor }]}>
+          <Text style={styles.itemBadgeText}>{item.bundle_value}</Text>
+        </View>
+      )}
+
+      <View style={styles.itemTop}>
+        <View style={[styles.itemIconWrap, { borderColor: tierColor + '70' }]}>
+          <Text style={styles.itemIcon}>{item.icon}</Text>
+        </View>
+        <View style={{ flex: 1, marginLeft: 12 }}>
+          <Text style={[styles.itemName, { color: tierColor }]} numberOfLines={1}>
+            {item.name}
+          </Text>
+          <Text style={styles.itemDesc} numberOfLines={2}>{item.description}</Text>
+        </View>
+      </View>
+
+      <View style={styles.itemBottom}>
+        {/* Price + buy */}
+        <View style={styles.itemPriceCol}>
+          {item.discount_pct > 0 && (
+            <Text style={styles.itemOriginalPrice}>
+              {item.price} {currencyLabel}
+            </Text>
+          )}
+          <View style={styles.itemPriceRow}>
+            <Text style={styles.itemPriceIcon}>{currencyIcon}</Text>
+            <Text style={[styles.itemPrice, { color: tierColor }]}>
+              {isRcPack ? `$${(item.price / 100).toFixed(2)}` : item.discounted_price.toLocaleString()}
+            </Text>
+          </View>
+        </View>
+
+        {/* Status / buy button */}
+        {item.is_locked ? (
+          <View style={styles.itemStatusBadge}>
+            <Text style={styles.itemStatusText}>🔒 {item.lock_reason}</Text>
+          </View>
+        ) : item.is_sold_out ? (
+          <View style={[styles.itemStatusBadge, { borderColor: COLORS.textMuted }]}>
+            <Text style={styles.itemStatusText}>SOLD OUT</Text>
+          </View>
+        ) : isRcPack ? (
+          <View style={[styles.itemStatusBadge, { borderColor: COLORS.gold }]}>
+            <Text style={[styles.itemStatusText, { color: COLORS.gold }]}>SOON</Text>
+          </View>
+        ) : (
+          <View style={[styles.itemBuyBtn, { borderColor: tierColor, backgroundColor: tierColor + '15' }]}>
+            <Text style={[styles.itemBuyText, { color: tierColor }]}>BUY</Text>
+          </View>
+        )}
+      </View>
+
+      {/* Daily limit indicator */}
+      {item.daily_limit !== null && !item.is_locked && (
+        <View style={styles.limitRow}>
+          <View style={styles.limitBarBg}>
+            <View style={[styles.limitBarFill, {
+              width: `${(item.purchased_today / item.daily_limit) * 100}%`,
+              backgroundColor: tierColor,
+            }]} />
+          </View>
+          <Text style={styles.limitText}>
+            {item.purchased_today}/{item.daily_limit} today
+          </Text>
+        </View>
+      )}
+    </TouchableOpacity>
+  )
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BUY MODAL
+// ═════════════════════════════════════════════════════════════════════════════
+type BuyState = 'confirm' | 'loading' | 'success' | 'error'
+
+function BuyModal({
+  item, playerRc, playerGold, onClose, onSuccess,
+}: {
+  item: ShopItem | null
+  playerRc: number
+  playerGold: number
+  onClose: () => void
+  onSuccess: () => void
+}) {
+  const [state, setState] = useState<BuyState>('confirm')
+  const [errorMsg, setErrorMsg] = useState<string>('')
+  const [resultData, setResultData] = useState<any>(null)
+  const sparkle = useRef(new Animated.Value(0)).current
+
+  useEffect(() => {
+    if (item) {
+      setState('confirm')
+      setErrorMsg('')
+      setResultData(null)
+    }
+  }, [item])
+
+  useEffect(() => {
+    if (state === 'success') {
+      sparkle.setValue(0)
+      Animated.timing(sparkle, {
+        toValue: 1, duration: 800,
+        easing: Easing.out(Easing.back(1.4)), useNativeDriver: true,
+      }).start()
+    }
+  }, [state])
+
+  if (!item) return null
+
+  const tierColor = TIER_COLORS[item.rarity_tier] ?? COLORS.cyan
+  const balance = item.currency === 'rc' ? playerRc : item.currency === 'gold' ? playerGold : 0
+  const finalPrice = item.discounted_price
+  const balanceAfter = balance - finalPrice
+  const canAfford = balance >= finalPrice
+  const currencyIcon = item.currency === 'rc' ? '💎' : item.currency === 'gold' ? '🪙' : '$'
+  const currencyLabel = item.currency === 'real' ? 'USD' : item.currency.toUpperCase()
+
+  const doPurchase = async () => {
+    if (!canAfford) {
+      setErrorMsg(item.currency === 'rc' ? 'Not enough Rift Crystals.' : 'Not enough Gold.')
+      setState('error')
+      return
+    }
+
+    setState('loading')
+    const idempotencyKey = `${item.code}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) {
+      setErrorMsg('Authentication failed.')
+      setState('error')
+      return
+    }
+
+    const { data: res, error } = await supabase.rpc('purchase_shop_item', {
+      p_player_id: user.id,
+      p_item_code: item.code,
+      p_idempotency_key: idempotencyKey,
+    })
+
+    if (error) {
+      setErrorMsg(error.message ?? 'Transaction failed.')
+      setState('error')
+      return
+    }
+
+    if (!res?.success) {
+      const errKey = res?.error ?? 'UNKNOWN'
+      setErrorMsg(translateError(errKey, res))
+      setState('error')
+      return
+    }
+
+    setResultData(res)
+    setState('success')
+  }
+
+  const handleClose = () => {
+    if (state === 'success') onSuccess()
+    onClose()
+  }
+
+  const sparkleScale = sparkle.interpolate({ inputRange: [0, 1], outputRange: [0.3, 1] })
+  const sparkleOpacity = sparkle.interpolate({ inputRange: [0, 0.4, 1], outputRange: [0, 1, 1] })
+
+  return (
+    <Modal visible={!!item} transparent animationType="fade" onRequestClose={handleClose}>
+      <View style={styles.modalOverlay}>
+        <TouchableOpacity
+          style={StyleSheet.absoluteFill}
+          activeOpacity={1}
+          onPress={state === 'success' || state === 'confirm' || state === 'error' ? handleClose : undefined}
+        />
+
+        <View style={[styles.modalBox, { borderColor: tierColor + 'AA' }]}>
+          {/* Tier glow corner */}
+          <View style={[styles.modalCornerGlow, { backgroundColor: tierColor }]} />
+
+          {state === 'confirm' && (
+            <>
+              {/* Item icon big */}
+              <View style={[styles.modalIconWrap, { borderColor: tierColor }]}>
+                <Text style={styles.modalIcon}>{item.icon}</Text>
+              </View>
+
+              {/* Name + tier */}
+              <Text style={[styles.modalName, { color: tierColor }]}>{item.name}</Text>
+              <Text style={styles.modalTier}>{item.rarity_tier.toUpperCase()}</Text>
+
+              {/* Lore */}
+              {item.lore && (
+                <View style={styles.modalLoreBox}>
+                  <Text style={styles.modalLoreSpeaker}>— Quartermaster Nyx</Text>
+                  <Text style={styles.modalLore}>"{item.lore}"</Text>
+                </View>
+              )}
+
+              {/* Reward summary */}
+              <View style={styles.modalRewardBox}>
+                <Text style={styles.modalRewardLabel}>YOU RECEIVE</Text>
+                <Text style={styles.modalReward}>{formatReward(item)}</Text>
+              </View>
+
+              {/* Price + balance preview */}
+              <View style={styles.modalPriceBox}>
+                <View style={styles.modalPriceRow}>
+                  <Text style={styles.modalPriceLabel}>Cost</Text>
+                  <Text style={[styles.modalPriceVal, { color: tierColor }]}>
+                    {currencyIcon} {finalPrice.toLocaleString()} {currencyLabel}
+                  </Text>
+                </View>
+                {item.currency !== 'real' && (
+                  <View style={styles.modalPriceRow}>
+                    <Text style={styles.modalPriceLabel}>Balance</Text>
+                    <Text style={[
+                      styles.modalPriceVal,
+                      { color: canAfford ? COLORS.textPrimary : COLORS.error, fontSize: 12 },
+                    ]}>
+                      {balance.toLocaleString()} → {Math.max(0, balanceAfter).toLocaleString()}
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              {/* Buttons */}
+              <View style={styles.modalBtnRow}>
+                <TouchableOpacity style={styles.modalCancelBtn} onPress={handleClose}>
+                  <Text style={styles.modalCancelText}>CANCEL</Text>
+                </TouchableOpacity>
+                {item.currency === 'real' ? (
+                  <View style={[styles.modalBuyBtn, { borderColor: COLORS.gold + '50', backgroundColor: COLORS.gold + '10' }]}>
+                    <Text style={[styles.modalBuyText, { color: COLORS.gold }]}>SOON</Text>
+                  </View>
+                ) : (
+                  <TouchableOpacity
+                    style={[
+                      styles.modalBuyBtn,
+                      { borderColor: tierColor, backgroundColor: tierColor + '20' },
+                      !canAfford && styles.modalBuyBtnDisabled,
+                    ]}
+                    onPress={doPurchase}
+                    disabled={!canAfford}
+                  >
+                    <Text style={[
+                      styles.modalBuyText,
+                      { color: canAfford ? tierColor : COLORS.textMuted },
+                    ]}>
+                      {canAfford ? 'BUY' : 'INSUFFICIENT'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </>
+          )}
+
+          {state === 'loading' && (
+            <View style={styles.modalCenter}>
+              <ActivityIndicator size="large" color={tierColor} />
+              <Text style={styles.modalLoadingText}>SEALING TRANSACTION...</Text>
+            </View>
+          )}
+
+          {state === 'success' && (
+            <Animated.View style={[
+              styles.modalCenter,
+              { transform: [{ scale: sparkleScale }], opacity: sparkleOpacity },
+            ]}>
+              <Text style={styles.modalSparkle}>✨</Text>
+              <Text style={[styles.modalSuccessTitle, { color: tierColor }]}>PURCHASED</Text>
+              <Text style={styles.modalSuccessReward}>{formatReward(item)}</Text>
+              {item.lore && (
+                <Text style={styles.modalSuccessQuote}>"Spend it well, commander." — Nyx</Text>
+              )}
+              <TouchableOpacity
+                style={[styles.modalDoneBtn, { borderColor: tierColor, backgroundColor: tierColor + '20' }]}
+                onPress={handleClose}
+              >
+                <Text style={[styles.modalDoneText, { color: tierColor }]}>DONE</Text>
+              </TouchableOpacity>
+            </Animated.View>
+          )}
+
+          {state === 'error' && (
+            <View style={styles.modalCenter}>
+              <Text style={styles.modalErrorIcon}>⚠</Text>
+              <Text style={styles.modalErrorTitle}>TRANSACTION FAILED</Text>
+              <Text style={styles.modalErrorText}>{errorMsg}</Text>
+              <TouchableOpacity style={styles.modalDoneBtn} onPress={handleClose}>
+                <Text style={styles.modalDoneText}>CLOSE</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
+      </View>
+    </Modal>
+  )
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+function formatReward(item: ShopItem): string {
+  switch (item.reward_type) {
+    case 'rc':            return `+${item.reward_amount.toLocaleString()} 💎 RC`
+    case 'gold':          return `+${item.reward_amount.toLocaleString()} 🪙 Gold`
+    case 'summon_scroll': return `+${item.reward_amount} 🪬 Echo Sigil${item.reward_amount > 1 ? 's' : ''}`
+    case 'dungeon_key':   return `+${item.reward_amount} 🗝️ Dungeon Key${item.reward_amount > 1 ? 's' : ''}`
+    case 'arena_token':   return `+${item.reward_amount} ⚔️ Arena Sigil${item.reward_amount > 1 ? 's' : ''}`
+    case 'pass_silver':   return `🥈 Silver Pass · ${item.reward_amount} days`
+    case 'pass_gold':     return `🥇 Gold Pass · ${item.reward_amount} days`
+    case 'echo_pass':     return `📜 Echo Pass · ${item.reward_amount} days`
+    case 'first_purchase_bonus': return '🎁 First Purchase Bonus unlocked'
+    case 'bundle': {
+      const e = item.reward_extra ?? {}
+      const parts: string[] = []
+      if (e.rc)      parts.push(`+${e.rc} 💎`)
+      if (e.gold)    parts.push(`+${e.gold} 🪙`)
+      if (e.scrolls) parts.push(`+${e.scrolls} 🪬`)
+      return parts.join('  ·  ') || 'Mystery cache'
+    }
+    default: return `${item.reward_amount}`
+  }
+}
+
+function translateError(key: string, res: any): string {
+  switch (key) {
+    case 'INSUFFICIENT_RC':   return `Not enough Rift Crystals. Need ${res.required}, have ${res.available}.`
+    case 'INSUFFICIENT_GOLD': return `Not enough Gold. Need ${res.required}, have ${res.available}.`
+    case 'DAILY_LIMIT_REACHED': return `Daily limit reached (${res.limit}/day). Try again tomorrow.`
+    case 'ALREADY_PURCHASED': return 'You\'ve already claimed this one-time offer.'
+    case 'LEVEL_TOO_LOW':     return `Requires level ${res.required_level}.`
+    case 'IAP_NOT_AVAILABLE': return res.message ?? 'Real-money purchases coming soon.'
+    case 'DUPLICATE_REQUEST': return 'Transaction already in progress.'
+    case 'ITEM_NOT_FOUND':    return 'This item is no longer available.'
+    case 'UNAUTHORIZED':      return 'Authentication failed. Please log in again.'
+    default: return res.message ?? `Error: ${key}`
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STYLES
+// ═════════════════════════════════════════════════════════════════════════════
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: COLORS.bg },
+
+  loadingContainer: { flex: 1, backgroundColor: COLORS.bg, alignItems: 'center', justifyContent: 'center', gap: 14, padding: 30 },
+  loadingText:      { color: COLORS.cyan, letterSpacing: 3, fontSize: 11, fontWeight: '700' },
+  errorIcon:        { fontSize: 48 },
+  errorTitle:       { fontSize: 14, fontWeight: '900', color: COLORS.error, letterSpacing: 3 },
+  errorMsg:         { fontSize: 12, color: COLORS.textSecondary, textAlign: 'center', lineHeight: 18, paddingHorizontal: 20, marginBottom: 8 },
+  retryBtn:         { paddingHorizontal: 28, paddingVertical: 10, borderWidth: 1, borderColor: COLORS.border, borderRadius: 8 },
+  retryText:        { fontSize: 12, fontWeight: '900', color: COLORS.textPrimary, letterSpacing: 2 },
+
+  // ─── HEADER ────────────────────────────────────────────────────────────────
+  header: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 16, paddingTop: 52, paddingBottom: 12,
+  },
+  backBtn:      { fontSize: 12, color: COLORS.textSecondary, letterSpacing: 1, width: 60 },
+  headerCenter: { alignItems: 'center' },
+  headerTitle:  { fontSize: 20, fontWeight: '900', color: COLORS.textPrimary, letterSpacing: 4 },
+  headerSub:    { fontSize: 9, color: COLORS.textMuted, letterSpacing: 2, marginTop: 2 },
+  balanceCol:   { gap: 2, alignItems: 'flex-end', minWidth: 80 },
+  balanceRow:   { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  balanceIcon:  { fontSize: 12 },
+  balanceText:  { fontSize: 12, fontWeight: '800' },
+
+  scrollContent: { paddingHorizontal: 16 },
+
+  // ─── HERO ──────────────────────────────────────────────────────────────────
+  heroCard: {
+    borderWidth: 1, borderRadius: 12, padding: 14, marginBottom: 14,
+    backgroundColor: COLORS.bgCard, position: 'relative', overflow: 'hidden',
+  },
+  heroGlow: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  heroBadge: {
+    alignSelf: 'flex-start', backgroundColor: COLORS.gold,
+    paddingHorizontal: 8, paddingVertical: 3, borderRadius: 4, marginBottom: 8,
+  },
+  heroBadgeText: { fontSize: 9, fontWeight: '900', color: COLORS.bg, letterSpacing: 2 },
+  heroContent:   { flexDirection: 'row', alignItems: 'center', gap: 14 },
+  heroIcon:      { fontSize: 48 },
+  heroName:      { fontSize: 18, fontWeight: '900', letterSpacing: 1, marginBottom: 4 },
+  heroDesc:      { fontSize: 11, color: COLORS.textSecondary, lineHeight: 16, marginBottom: 8 },
+  heroPriceRow:  { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  heroOriginalPrice: { fontSize: 11, color: COLORS.textMuted, textDecorationLine: 'line-through' },
+  heroPrice:     { fontSize: 16, fontWeight: '900', letterSpacing: 1 },
+  heroDiscount:  { paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
+  heroDiscountText: { fontSize: 10, fontWeight: '900', color: '#fff' },
+
+  // ─── TABS ──────────────────────────────────────────────────────────────────
+  tabRow:        { flexDirection: 'row', gap: 6, paddingVertical: 4, marginBottom: 12 },
+  tab: {
+    paddingHorizontal: 12, paddingVertical: 7, borderRadius: 6,
+    borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.bgCard,
+  },
+  tabActive:     { borderColor: COLORS.cyan, backgroundColor: COLORS.cyan + '15' },
+  tabText:       { fontSize: 10, fontWeight: '800', color: COLORS.textMuted, letterSpacing: 1 },
+  tabTextActive: { color: COLORS.cyan },
+
+  // ─── ITEM CARD ─────────────────────────────────────────────────────────────
+  itemsList:     { gap: 10 },
+  itemCard: {
+    backgroundColor: COLORS.bgCard, borderRadius: 10,
+    borderWidth: 1, padding: 12, position: 'relative', overflow: 'hidden',
+  },
+  itemCardDimmed:    { opacity: 0.55 },
+  itemBadge: {
+    position: 'absolute', top: 0, right: 0,
+    paddingHorizontal: 8, paddingVertical: 3,
+    borderBottomLeftRadius: 6,
+  },
+  itemBadgeText: { fontSize: 8, fontWeight: '900', color: COLORS.bg, letterSpacing: 1 },
+  itemTop:       { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
+  itemIconWrap: {
+    width: 48, height: 48, borderRadius: 8, borderWidth: 1,
+    backgroundColor: 'rgba(0,0,0,0.3)', alignItems: 'center', justifyContent: 'center',
+  },
+  itemIcon:       { fontSize: 26 },
+  itemName:       { fontSize: 13, fontWeight: '900', letterSpacing: 0.5, marginBottom: 3 },
+  itemDesc:       { fontSize: 10, color: COLORS.textMuted, lineHeight: 14 },
+  itemBottom:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  itemPriceCol:   { gap: 2 },
+  itemOriginalPrice: { fontSize: 10, color: COLORS.textMuted, textDecorationLine: 'line-through' },
+  itemPriceRow:   { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  itemPriceIcon:  { fontSize: 13 },
+  itemPrice:      { fontSize: 15, fontWeight: '900' },
+  itemBuyBtn:     { paddingHorizontal: 16, paddingVertical: 7, borderWidth: 1, borderRadius: 6 },
+  itemBuyText:    { fontSize: 12, fontWeight: '900', letterSpacing: 1 },
+  itemStatusBadge:{ paddingHorizontal: 10, paddingVertical: 7, borderWidth: 1, borderRadius: 6, borderColor: COLORS.border },
+  itemStatusText: { fontSize: 10, fontWeight: '700', color: COLORS.textMuted, letterSpacing: 1 },
+
+  limitRow:       { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 },
+  limitBarBg:     { flex: 1, height: 3, backgroundColor: 'rgba(255,255,255,0.08)', borderRadius: 2, overflow: 'hidden' },
+  limitBarFill:   { height: '100%', borderRadius: 2 },
+  limitText:      { fontSize: 9, color: COLORS.textMuted, letterSpacing: 0.5 },
+
+  emptyText:      { color: COLORS.textMuted, textAlign: 'center', fontSize: 12, padding: 30 },
+
+  // ─── BUY MODAL ─────────────────────────────────────────────────────────────
+  modalOverlay:   { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', alignItems: 'center', justifyContent: 'center', padding: 20 },
+  modalBox: {
+    width: '100%', maxWidth: 360,
+    backgroundColor: COLORS.bgCard, borderRadius: 14, borderWidth: 1.5,
+    padding: 20, position: 'relative', overflow: 'hidden',
+  },
+  modalCornerGlow: {
+    position: 'absolute', top: -40, right: -40,
+    width: 120, height: 120, borderRadius: 60, opacity: 0.15,
+  },
+  modalIconWrap: {
+    width: 76, height: 76, borderRadius: 12, borderWidth: 2,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    alignItems: 'center', justifyContent: 'center', alignSelf: 'center', marginBottom: 10,
+  },
+  modalIcon:        { fontSize: 42 },
+  modalName:        { fontSize: 17, fontWeight: '900', letterSpacing: 1, textAlign: 'center', marginBottom: 4 },
+  modalTier:        { fontSize: 9, color: COLORS.textMuted, letterSpacing: 3, textAlign: 'center', marginBottom: 12 },
+  modalLoreBox:     { backgroundColor: 'rgba(0,0,0,0.25)', borderRadius: 8, padding: 10, marginBottom: 12 },
+  modalLoreSpeaker: { fontSize: 8, color: COLORS.cyan, letterSpacing: 2, marginBottom: 4, fontWeight: '700' },
+  modalLore:        { fontSize: 11, color: COLORS.textSecondary, fontStyle: 'italic', lineHeight: 16 },
+
+  modalRewardBox:   { borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, padding: 10, marginBottom: 12, alignItems: 'center' },
+  modalRewardLabel: { fontSize: 9, color: COLORS.textMuted, letterSpacing: 2, marginBottom: 4 },
+  modalReward:      { fontSize: 14, fontWeight: '800', color: COLORS.textPrimary },
+
+  modalPriceBox:    { gap: 6, marginBottom: 16 },
+  modalPriceRow:    { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  modalPriceLabel:  { fontSize: 11, color: COLORS.textMuted, letterSpacing: 1 },
+  modalPriceVal:    { fontSize: 14, fontWeight: '900' },
+
+  modalBtnRow:      { flexDirection: 'row', gap: 10 },
+  modalCancelBtn:   { flex: 1, paddingVertical: 12, borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, alignItems: 'center' },
+  modalCancelText:  { fontSize: 12, fontWeight: '800', color: COLORS.textMuted, letterSpacing: 1 },
+  modalBuyBtn:      { flex: 1, paddingVertical: 12, borderWidth: 1.5, borderRadius: 8, alignItems: 'center' },
+  modalBuyBtnDisabled: { opacity: 0.5 },
+  modalBuyText:     { fontSize: 13, fontWeight: '900', letterSpacing: 1 },
+
+  modalCenter:      { alignItems: 'center', paddingVertical: 24, gap: 10 },
+  modalLoadingText: { fontSize: 11, color: COLORS.textMuted, letterSpacing: 2, marginTop: 6 },
+  modalSparkle:     { fontSize: 56, marginBottom: 4 },
+  modalSuccessTitle:{ fontSize: 18, fontWeight: '900', letterSpacing: 3, marginBottom: 4 },
+  modalSuccessReward:{ fontSize: 14, fontWeight: '800', color: COLORS.textPrimary, marginBottom: 8 },
+  modalSuccessQuote:{ fontSize: 11, color: COLORS.textMuted, fontStyle: 'italic', textAlign: 'center', marginBottom: 12 },
+  modalErrorIcon:   { fontSize: 38 },
+  modalErrorTitle:  { fontSize: 14, fontWeight: '900', color: COLORS.error, letterSpacing: 2 },
+  modalErrorText:   { fontSize: 12, color: COLORS.textSecondary, textAlign: 'center', lineHeight: 17, marginBottom: 8 },
+  modalDoneBtn:     { paddingHorizontal: 32, paddingVertical: 11, borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, marginTop: 4 },
+  modalDoneText:    { fontSize: 12, fontWeight: '900', letterSpacing: 2, color: COLORS.textPrimary },
+})
