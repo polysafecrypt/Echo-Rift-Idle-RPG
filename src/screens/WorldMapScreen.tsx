@@ -9,7 +9,7 @@
 import React, { useEffect, useRef, useCallback, useState } from 'react'
 import {
   View, Text, StyleSheet, TouchableOpacity, Animated,
-  Dimensions, StatusBar, Alert, ImageBackground,
+  Dimensions, StatusBar, Alert, ImageBackground, Image,
 } from 'react-native'
 import { LinearGradient } from 'expo-linear-gradient'
 import { useFocusEffect, useNavigation } from '@react-navigation/native'
@@ -24,6 +24,13 @@ import QuestBottomSheet from '../components/QuestBottomSheet'
 import AfkRewardModal from '../components/AfkRewardModal'
 
 const { width, height } = Dimensions.get('window')
+
+// ─── CLASS PORTRAIT IMAGES ───────────────────────────────────────────────────
+const CLASS_IMAGES: Record<string, any> = {
+  vanguard: require('../../assets/vanguard.png'),
+  phantom:  require('../../assets/phantom.png'),
+  riftmage: require('../../assets/riftmage.png'),
+}
 
 const ZONES = [
   { id: 'arena',   screen: 'Arena',     label: 'ARENA',      color: '#B366FF', top: height * 0.18 },
@@ -212,8 +219,8 @@ export default function WorldMapScreen() {
   const [levelUpVisible, setLevelUpVisible] = useState(false)
   const [newLevel,       setNewLevel]       = useState(0)
   const [toastVisible,   setToastVisible]   = useState(false)
+  // DailyLoginModal — modal kendi RPC'sini çağırır, has_reward=false ise otomatik kapanır
   const [showLoginModal, setShowLoginModal] = useState(false)
-  const [loginReward,    setLoginReward]    = useState<any>(null)
   const [toastMsg,       setToastMsg]       = useState('')
 
   // ✅ AFK state
@@ -225,7 +232,8 @@ export default function WorldMapScreen() {
   const userIdRef            = useRef<string | null>(null)
   const activeQuestEndsAtRef = useRef<string | null>(null)
   const syncInProgressRef    = useRef(false)
-  const prevLevelRef         = useRef(0)
+  const loginModalShownRef      = useRef(false)
+  const prevLevelRef            = useRef(0)
 
   useEffect(() => {
     isMountedRef.current = true
@@ -244,7 +252,7 @@ export default function WorldMapScreen() {
     ]).start(() => { if (isMountedRef.current) setToastVisible(false) })
   }, [])
 
-  // ✅ AFK preview kontrol — her 60 saniyede bir
+  // ✅ AFK preview kontrol
   const checkAfkReward = useCallback(async (uid: string) => {
     const { data } = await supabase.rpc('preview_afk_rewards', { p_player_id: uid })
     if (data && isMountedRef.current) {
@@ -259,7 +267,6 @@ export default function WorldMapScreen() {
       counter++
       setTick(t => t + 1)
 
-      // Her 60 saniyede AFK kontrol
       if (counter % 60 === 0 && userIdRef.current) {
         checkAfkReward(userIdRef.current)
       }
@@ -325,13 +332,13 @@ export default function WorldMapScreen() {
     }
     prevLevelRef.current = currentLevel
 
-    // ✅ AFK kontrol — uygulama açılışında
+    // AFK kontrol
     await checkAfkReward(user.id)
 
-    // Günlük login ödülü
-    const { data: lrData } = await supabase.rpc('get_and_mark_login_reward', { p_player_id: user.id })
-    if (lrData?.has_reward && isMountedRef.current) {
-      setLoginReward(lrData)
+    // Daily login modal — sadece app açılışında bir kez tetikle
+    // Her WorldMap focus'unda açılmaması için ref ile kontrol
+    if (!loginModalShownRef.current) {
+      loginModalShownRef.current = true
       setShowLoginModal(true)
     }
 
@@ -426,6 +433,9 @@ export default function WorldMapScreen() {
     return ''
   }
 
+  // Class portrait: assets'ten gerçek görsel, fallback emoji
+  const classPortrait = player.class_type ? CLASS_IMAGES[player.class_type] : null
+
   return (
     <View style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
@@ -445,8 +455,17 @@ export default function WorldMapScreen() {
       {/* ── HEADER ── */}
       <View style={styles.header}>
         <TouchableOpacity style={styles.profileBtn} onPress={() => navigation.navigate('Profile')} activeOpacity={0.8}>
+          {/* ✅ Class portrait — gerçek görsel, fallback emoji */}
           <View style={[styles.profileAvatar, { borderColor: classInfo?.color || COLORS.neonGreen }]}>
-            <Text style={styles.profileIcon}>{classInfo?.icon || '👤'}</Text>
+            {classPortrait ? (
+              <Image
+                source={classPortrait}
+                style={styles.profileImage}
+                resizeMode="cover"
+              />
+            ) : (
+              <Text style={styles.profileIcon}>{classInfo?.icon || '👤'}</Text>
+            )}
           </View>
           <View>
             <Text style={styles.profileName}>{player.username}</Text>
@@ -512,7 +531,7 @@ export default function WorldMapScreen() {
         />
       </View>
 
-      {/* ── AFK BUTTON — sağ alt köşe ── */}
+      {/* ── AFK BUTTON ── */}
       <View style={styles.afkBtnPos}>
         <AfkButton
           onPress={() => setAfkModalVisible(true)}
@@ -553,14 +572,11 @@ export default function WorldMapScreen() {
         onDismiss={() => setAfkModalVisible(false)}
       />
 
+      {/* ✅ Yeni DailyLoginModal — kendi RPC'sini çağırır, has_reward=false ise kapanır */}
       <DailyLoginModal
         visible={showLoginModal}
-        dayNumber={loginReward?.day_number || 1}
-        streak={loginReward?.streak || 1}
-        goldReward={loginReward?.gold_reward || 0}
-        rcReward={loginReward?.rc_reward || 0}
-        itemRarity={loginReward?.item_rarity || null}
         onClose={() => setShowLoginModal(false)}
+        onClaimed={() => fetchPlayerState(userId!)}
       />
 
       <LevelUpModal
@@ -585,7 +601,15 @@ const styles = StyleSheet.create({
     zIndex: 50,
   },
   profileBtn:    { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  profileAvatar: { width: 40, height: 40, borderRadius: 8, borderWidth: 1.5, backgroundColor: 'rgba(255,255,255,0.04)', alignItems: 'center', justifyContent: 'center' },
+  profileAvatar: {
+    width: 44, height: 44, borderRadius: 8, borderWidth: 1.5,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    alignItems: 'center', justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  // ✅ Gerçek görsel için
+  profileImage:  { width: '100%', height: '100%' },
+  // Fallback emoji
   profileIcon:   { fontSize: 22 },
   profileName:   { fontSize: 14, fontWeight: '800', color: '#E8E8E8', letterSpacing: 1 },
   profileClass:  { fontSize: 9, fontWeight: '700', letterSpacing: 2, marginTop: 1 },
@@ -619,25 +643,11 @@ const styles = StyleSheet.create({
 
   zoneAbsolute: { position: 'absolute', left: 0, right: 0, alignItems: 'center', zIndex: 10 },
 
-  questsBtnPos: {
-    position: 'absolute',
-    left: 24,
-    top: height * 0.46,
-    zIndex: 10,
-  },
-
-  afkBtnPos: {
-    position: 'absolute',
-    right: 24,
-    bottom: 40,
-    zIndex: 10,
-  },
+  questsBtnPos: { position: 'absolute', left: 24, top: height * 0.46, zIndex: 10 },
+  afkBtnPos:    { position: 'absolute', right: 24, bottom: 40, zIndex: 10 },
 
   sheetOverlay: {
-    position: 'absolute',
-    top: 0, left: 0, right: 0,
-    bottom: '52%',
-    zIndex: 50,
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: '52%', zIndex: 50,
   },
   toast: {
     position: 'absolute', top: 60, left: 16, right: 16,

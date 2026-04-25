@@ -303,4 +303,4 @@ const styles = StyleSheet.create({
     fontSize: 18, fontWeight: '900',
     color: COLORS.neonGreen, letterSpacing: 4,
   },
-})
+})  
