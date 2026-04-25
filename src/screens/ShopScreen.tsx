@@ -113,8 +113,6 @@ export default function ShopScreen({ navigation }: any) {
     }
     setLoadError(null)
     const { data: res, error } = await supabase.rpc('get_shop_offers', { p_player_id: id })
-    console.log('[Shop] RPC raw response:', JSON.stringify(res, null, 2))
-    console.log('[Shop] items count:', res?.items?.length ?? 'no items field')
     if (error) {
       console.error('[Shop] RPC error:', error)
       setLoadError(`RPC error: ${error.message ?? 'unknown'}`)
@@ -215,16 +213,6 @@ export default function ShopScreen({ navigation }: any) {
             <Text style={[styles.balanceText, { color: COLORS.gold }]}>{player.gold.toLocaleString()}</Text>
           </View>
         </View>
-      </View>
-
-      {/* ─── DEBUG (geçici, sonra kaldıracağız) ─── */}
-      <View style={{ backgroundColor: '#FF0044', padding: 8, marginHorizontal: 16, marginBottom: 8, borderRadius: 4 }}>
-        <Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>
-          items={data.items?.length ?? 'undef'} | rc={player.rc} | gold={player.gold} | uid={userId?.slice(0,8)}
-        </Text>
-        <Text style={{ color: '#fff', fontSize: 9, marginTop: 2 }}>
-          first: {data.items?.[0]?.code ?? 'NONE'} | featured: {data.items?.find(it => it.is_featured)?.code ?? 'NONE'}
-        </Text>
       </View>
 
       <ScrollView
