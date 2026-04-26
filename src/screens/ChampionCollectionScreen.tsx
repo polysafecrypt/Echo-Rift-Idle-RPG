@@ -289,11 +289,11 @@ function ChampionDetailModal({
                       style={styles.unequipBtn}
                       onPress={() => onUnequip(champ.pc_id)}
                     >
-                      <Text style={styles.unequipBtnTxt}>SLOT {champ.slot_index + 1}'DEN ÇIKAR</Text>
+                      <Text style={styles.unequipBtnTxt}>UNEQUIP FROM SLOT {champ.slot_index + 1}</Text>
                     </TouchableOpacity>
                   ) : (
                     <View style={styles.equipRow}>
-                      <Text style={styles.equipLabel}>Slota yerleştir:</Text>
+                      <Text style={styles.equipLabel}>Equip to slot:</Text>
                       {[0, 1].map(slot => (
                         <TouchableOpacity
                           key={slot}
@@ -302,7 +302,7 @@ function ChampionDetailModal({
                         >
                           <Text style={[styles.equipSlotBtnTxt, { color: rc }]}>
                             SLOT {slot + 1}
-                            {activeSlots[slot] ? ` (${activeSlots[slot].name.split(' ')[0]})` : ' (boş)'}
+                            {activeSlots[slot] ? ` (${activeSlots[slot].name.split(' ')[0]})` : ' (empty)'}
                           </Text>
                         </TouchableOpacity>
                       ))}
@@ -316,7 +316,7 @@ function ChampionDetailModal({
               <View style={styles.lockedView}>
                 <Text style={styles.lockedIcon}>🔒</Text>
                 <Text style={styles.lockedName}>{champ.name}</Text>
-                <Text style={styles.lockedDesc}>Bu champion henüz koleksiyonunda yok.</Text>
+                <Text style={styles.lockedDesc}>This champion is not in your collection yet.</Text>
                 <Text style={[styles.lockedRarity, { color: rc }]}>{champ.rarity}</Text>
                 {/* Locked olsa bile skill detayını göster — oyuncu görmek isteyebilir */}
                 <TouchableOpacity
@@ -324,7 +324,7 @@ function ChampionDetailModal({
                   onPress={onShowSkillPreview}
                   activeOpacity={0.7}
                 >
-                  <Text style={[styles.skillInfoBtnTxt, { color: rc }]}>? SKİLLERİ GÖR</Text>
+                  <Text style={[styles.skillInfoBtnTxt, { color: rc }]}>? VIEW SKILLS</Text>
                 </TouchableOpacity>
                 <Text style={styles.loreText}>{champ.lore}</Text>
               </View>
@@ -478,7 +478,7 @@ export default function ChampionCollectionScreen({ navigation }: any) {
                   <Text style={styles.activeSlotLv}>Lv{activeSlots[slot].level}</Text>
                 </>
               ) : (
-                <Text style={styles.emptySlot}>SLOT {slot + 1}{'\n'}BOŞ</Text>
+                <Text style={styles.emptySlot}>SLOT {slot + 1}{'\n'}EMPTY</Text>
               )}
             </View>
           ))}
@@ -495,7 +495,7 @@ export default function ChampionCollectionScreen({ navigation }: any) {
             onPress={() => setFilter(f)}
           >
             <Text style={[styles.filterBtnTxt, filter === f && styles.filterBtnTxtActive]}>
-              {f === 'all' ? 'TÜMÜ' : f === 'owned' ? 'SAHİBİM' :
+              {f === 'all' ? 'ALL' : f === 'owned' ? 'OWNED' :
                 `${ELEMENT_ICONS[f]} ${f.toUpperCase()}`}
             </Text>
           </TouchableOpacity>
@@ -514,9 +514,9 @@ export default function ChampionCollectionScreen({ navigation }: any) {
         )}
         ListEmptyComponent={
           loading ? (
-            <Text style={styles.empty}>Yükleniyor...</Text>
+            <Text style={styles.empty}>Loading...</Text>
           ) : (
-            <Text style={styles.empty}>Champion bulunamadı</Text>
+            <Text style={styles.empty}>No champions found</Text>
           )
         }
       />

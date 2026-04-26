@@ -129,7 +129,7 @@ export default function SettingsScreen({ navigation }: any) {
                     {lang === 'EN' ? '🇬🇧' : '🇹🇷'}
                   </Text>
                   <Text style={[styles.langText, language === lang && { color: COLORS.neonGreen }]}>
-                    {lang === 'EN' ? 'English' : 'Türkçe'}
+                    {lang === 'EN' ? 'English' : 'Turkish'}
                   </Text>
                   {language === lang && (
                     <Text style={styles.langCheck}>✓</Text>

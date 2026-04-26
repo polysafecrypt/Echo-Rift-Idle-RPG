@@ -233,7 +233,7 @@ export default function DailyLoginModal({ visible, onClose, onClaimed }: Props) 
               <Text style={[styles.claimBtnTxt, {
                 color: claimed ? 'rgba(255,255,255,0.3)' : accentColor,
               }]}>
-                {claimed ? '✓ COLLECTED' : 'COLLECT'}
+                {claimed ? '✓ COLLECTED' : 'CLAIM ✓'}
               </Text>
             </TouchableOpacity>
 

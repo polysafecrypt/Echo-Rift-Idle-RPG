@@ -1027,7 +1027,7 @@ export default function ArenaBattleModal({
               <View style={styles.logDivider} />
               <ScrollView ref={logScrollRef} style={styles.logScroll} showsVerticalScrollIndicator={false}>
                 {logEntries.map(entry => <LogRow key={entry.id} entry={entry} />)}
-                {logEntries.length === 0 && <Text style={styles.logEmpty}>Savaş başlıyor...</Text>}
+                {logEntries.length === 0 && <Text style={styles.logEmpty}>Battle starting...</Text>}
               </ScrollView>
             </Animated.View>
           )}

@@ -396,7 +396,7 @@ export default function ProfileScreen({ navigation }: any) {
                 <Text style={[styles.passCardName, { color: '#C0C0C0' }]}>🥈 SILVER PASS</Text>
                 <TouchableOpacity
                   style={[styles.buyBtn, { borderColor: '#C0C0C0' }]}
-                  onPress={() => { setShowPassModal(false); Alert.alert('Yakında', 'Satın alma sistemi yakında!') }}
+                  onPress={() => { setShowPassModal(false); Alert.alert('Coming Soon', 'Purchase system coming soon!') }}
                 >
                   <Text style={[styles.buyBtnText, { color: '#C0C0C0' }]}>💎 400</Text>
                 </TouchableOpacity>

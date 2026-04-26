@@ -232,7 +232,7 @@ export default function SummonScreen({ navigation }: any) {
         {banners.length === 0 && userId && (
           <View style={styles.emptyState}>
             <TouchableOpacity style={styles.retryBtn} onPress={loadBanners}>
-              <Text style={styles.retryBtnTxt}>↻ YENİLE</Text>
+              <Text style={styles.retryBtnTxt}>↻ REFRESH</Text>
             </TouchableOpacity>
           </View>
         )}
@@ -254,7 +254,7 @@ export default function SummonScreen({ navigation }: any) {
 
             {/* Pity barları */}
             <View style={styles.pitySection}>
-              <Text style={styles.pitySectionTitle}>PİTY SAYAÇLARI</Text>
+              <Text style={styles.pitySectionTitle}>PITY COUNTERS</Text>
               <View style={styles.pityRow}>
                 <Text style={styles.pityLabel}>Epic ({currentPity?.epic_count || 0}/{activeBanner.pity?.epic || 30})</Text>
                 <View style={styles.pityBarBg}>
@@ -295,7 +295,7 @@ export default function SummonScreen({ navigation }: any) {
                 disabled={loading}
               >
                 <Text style={styles.pullBtnTitle}>1× SUMMON</Text>
-                <Text style={styles.pullBtnCost}>📜 1 scroll  veya  💎 {activeBanner.cost_rc}</Text>
+                <Text style={styles.pullBtnCost}>📜 1 scroll  or  💎 {activeBanner.cost_rc}</Text>
               </TouchableOpacity>
 
               <TouchableOpacity
@@ -304,9 +304,9 @@ export default function SummonScreen({ navigation }: any) {
                 disabled={loading}
               >
                 <Text style={styles.pullBtnTitle}>10× SUMMON</Text>
-                <Text style={styles.pullBtnCost}>📜 10 scroll  veya  💎 {activeBanner.cost_rc_10x}</Text>
+                <Text style={styles.pullBtnCost}>📜 10 scroll  or  💎 {activeBanner.cost_rc_10x}</Text>
                 <View style={styles.valueBadge}>
-                  <Text style={styles.valueBadgeTxt}>%10 İNDİRİM</Text>
+                  <Text style={styles.valueBadgeTxt}>10% OFF</Text>
                 </View>
               </TouchableOpacity>
             </View>
@@ -329,13 +329,13 @@ export default function SummonScreen({ navigation }: any) {
           <View style={styles.resultsBox}>
 
             <Text style={styles.resultsTitle}>
-              {pullResults.length === 1 ? '1× SUMMON SONUCU' : '10× SUMMON SONUÇLARI'}
+              {pullResults.length === 1 ? '1× SUMMON RESULT' : '10× SUMMON RESULTS'}
             </Text>
 
             {/* Tap hint */}
             {revealedCount < pullResults.length && (
               <TouchableOpacity style={styles.revealAllBanner} onPress={handleRevealAll}>
-                <Text style={styles.revealAllBannerTxt}>✨ KARTLARA DOKUN VEYA HEPSİNİ AÇ</Text>
+                <Text style={styles.revealAllBannerTxt}>✨ TAP CARDS OR REVEAL ALL</Text>
               </TouchableOpacity>
             )}
 
@@ -374,7 +374,7 @@ export default function SummonScreen({ navigation }: any) {
                 onPress={() => { if (allRevealed) { setShowResults(false) } else { handleRevealAll() } }}
               >
                 <Text style={styles.closeResultTxt}>
-                  {allRevealed ? 'TAMAM' : '✨ HEPSİNİ AÇ'}
+                  {allRevealed ? 'OK' : '✨ REVEAL ALL'}
                 </Text>
               </TouchableOpacity>
             </View>
